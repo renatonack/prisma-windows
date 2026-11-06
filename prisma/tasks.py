@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 PAGE_DEBLOAT = "debloat"
 PAGE_OTIMIZACAO = "otimizacao"
+PAGE_DRIVERS = "drivers"
 PAGE_REMOVER = "remover"
 PAGE_INSTALAR = "instalar"
 
@@ -102,6 +103,44 @@ function Remove-App([string[]]$Patterns) {
     }
 }
 
+$script:UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+function Get-Page([string]$Url) {
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.UserAgent = $script:UA
+    $req.AutomaticDecompression = [Net.DecompressionMethods]'GZip, Deflate'
+    $resp = $req.GetResponse()
+    try { (New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } finally { $resp.Close() }
+}
+
+function Download-File([string]$Url, [string]$OutFile, [string]$Referer = '') {
+    New-Item -ItemType Directory -Force (Split-Path $OutFile) | Out-Null
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.UserAgent = $script:UA
+    if ($Referer) { $req.Referer = $Referer }
+    $resp = $req.GetResponse()
+    try {
+        if ($resp.ContentType -like 'text/html*') { throw 'o site devolveu uma página em vez do instalador' }
+        $in = $resp.GetResponseStream()
+        $out = [IO.File]::Create($OutFile)
+        try { $in.CopyTo($out) } finally { $out.Close(); $in.Close() }
+    } finally { $resp.Close() }
+}
+
+# Abre um link no navegador do usuário (via Explorer, para o navegador não abrir como administrador)
+function Open-Url([string]$Url) { Start-Process -FilePath 'explorer.exe' -ArgumentList $Url }
+
+function Test-Signed([string]$File, [string]$Publisher) {
+    $sig = Get-AuthenticodeSignature -FilePath $File
+    if ($sig.Status -ne 'Valid' -or ($Publisher -and $sig.SignerCertificate.Subject -notmatch $Publisher)) {
+        Remove-Item $File -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Say ("Assinatura digital OK ({0})" -f ($sig.SignerCertificate.Subject -split ',')[0])
+    return $true
+}
+
 function Get-Winget {
     $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -133,20 +172,14 @@ function Install-App {
     }
     if ($Url) {
         try {
-            $dir = Join-Path $env:TEMP 'prisma-dl'
-            New-Item -ItemType Directory -Force $dir | Out-Null
-            $file = Join-Path $dir (($Name -replace '\W', '') + '-setup.exe')
+            $file = Join-Path (Join-Path $env:TEMP 'prisma-dl') (($Name -replace '\W', '') + '-setup.exe')
             Say ("Baixando {0} do site oficial..." -f $Name)
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $Url -OutFile $file -UseBasicParsing -ErrorAction Stop
-            $sig = Get-AuthenticodeSignature -FilePath $file
-            if ($sig.Status -ne 'Valid' -or ($Publisher -and $sig.SignerCertificate.Subject -notmatch $Publisher)) {
-                Remove-Item $file -Force -ErrorAction SilentlyContinue
+            Download-File $Url $file
+            if (-not (Test-Signed $file $Publisher)) {
                 Fail ("Assinatura digital de {0} não confere - instalador descartado." -f $Name)
-                if ($Page) { Start-Process $Page }
+                if ($Page) { Open-Url $Page }
                 return
             }
-            Say ("Assinatura digital OK ({0})" -f ($sig.SignerCertificate.Subject -split ',')[0])
             if ($SilentArgs) { $p = Start-Process -FilePath $file -ArgumentList $SilentArgs -Wait -PassThru }
             else { $p = Start-Process -FilePath $file -Wait -PassThru }
             if ($p.ExitCode -eq 0) { Ok ("{0} instalado" -f $Name) }
@@ -157,7 +190,7 @@ function Install-App {
         }
     }
     if ($Page) {
-        Start-Process $Page
+        Open-Url $Page
         Warn ("Abri a página oficial do {0} para você instalar manualmente." -f $Name)
     }
 }
@@ -950,6 +983,127 @@ _add(
     script=rf"""
 Set-Reg '{ADV}' 'HideFileExt' 0
 Reg-Done 'Extensões visíveis'
+""",
+)
+
+# ---------------------------------------------------------------------------
+# DRIVERS
+# ---------------------------------------------------------------------------
+_add(
+    id="drivers_wu", page=PAGE_DRIVERS, section="Windows Update", order=60,
+    title="Instalar todos os drivers que faltam",
+    desc="Procura no Windows Update os drivers deste PC (rede, áudio, chipset, Bluetooth, vídeo...), baixa e "
+         "instala um por um. No fim, mostra se sobrou algum dispositivo sem driver.",
+    note="Pode levar de 2 a 20 minutos na primeira vez, dependendo da internet.",
+    script=r"""
+Say 'Procurando drivers no Windows Update (pode levar alguns minutos)...'
+try {
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $session.ClientApplicationID = 'Prisma'
+    $searcher = $session.CreateUpdateSearcher()
+    $searcher.ServerSelection = 2
+    $result = $searcher.Search("IsInstalled=0 and Type='Driver' and IsHidden=0")
+} catch {
+    Fail ("Não consegui consultar o Windows Update: {0}" -f $_.Exception.Message)
+    Say 'Confira se a internet está funcionando e tente de novo.'
+    return
+}
+# um driver por dispositivo: fica o mais novo
+$best = @{}
+foreach ($u in $result.Updates) {
+    $key = if ($u.DriverHardwareID) { $u.DriverHardwareID } else { $u.Identity.UpdateID }
+    if (-not $best.ContainsKey($key) -or $u.DriverVerDate -gt $best[$key].DriverVerDate) { $best[$key] = $u }
+}
+$updates = @($best.Values)
+if ($updates.Count -eq 0) {
+    Ok 'Nenhum driver pendente: o Windows Update não tem nada mais novo para este PC'
+} else {
+    Say ("{0} drivers encontrados" -f $updates.Count)
+    $i = 0; $okN = 0; $reboot = $false
+    foreach ($u in $updates) {
+        $i++
+        Say ("[{0}/{1}] {2} ({3:N0} MB)" -f $i, $updates.Count, $u.Title, ($u.MaxDownloadSize / 1MB))
+        try {
+            if (-not $u.EulaAccepted) { $u.AcceptEula() }
+            $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+            [void]$coll.Add($u)
+            $dl = $session.CreateUpdateDownloader()
+            $dl.Updates = $coll
+            $dr = $dl.Download()
+            if ($dr.ResultCode -ne 2 -and $dr.ResultCode -ne 3) { Warn ("Download falhou: {0}" -f $u.Title); continue }
+            $inst = $session.CreateUpdateInstaller()
+            $inst.Updates = $coll
+            try { $inst.AllowSourcePrompts = $false } catch {}
+            $ir = $inst.Install()
+            if ($ir.ResultCode -eq 2 -or $ir.ResultCode -eq 3) {
+                $okN++
+                Ok ("Instalado: {0}" -f $u.Title)
+                if ($ir.RebootRequired) { $reboot = $true }
+            } else { Warn ("Não instalou: {0} (código {1})" -f $u.Title, $ir.ResultCode) }
+        } catch { Warn ("Falha em {0}: {1}" -f $u.Title, $_.Exception.Message) }
+    }
+    Ok ("{0} de {1} drivers instalados" -f $okN, $updates.Count)
+    if ($reboot) { Say 'Alguns drivers só terminam de instalar depois de reiniciar.' }
+}
+$missing = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.ConfigManagerErrorCode -eq 28 })
+if ($missing.Count -gt 0) {
+    Warn ("{0} dispositivo(s) ainda sem driver:" -f $missing.Count)
+    $missing | Select-Object -First 8 | ForEach-Object { Say ("- {0}" -f $_.Name) }
+    Say 'Reinicie e rode de novo. Se continuar, baixe no site da placa-mãe ou do notebook.'
+} else { Ok 'Todos os dispositivos estão com driver' }
+""",
+)
+
+_add(
+    id="drivers_gpu", page=PAGE_DRIVERS, section="Placa de vídeo", order=97,
+    title="Driver mais novo da placa de vídeo",
+    desc="Detecta sua placa (NVIDIA, AMD ou Intel), baixa o app oficial da fabricante — NVIDIA App, AMD Adrenalin "
+         "ou Intel Driver & Support Assistant — confere a assinatura digital e abre o instalador.",
+    note="Roda por último. O instalador abre na tela: é só seguir os passos. Ele traz drivers mais novos que os do "
+         "Windows Update, o que importa para jogos.",
+    script=r"""
+function Install-GpuTool([string]$Vendor) {
+    $all = @{
+        nvidia = @{ Name = 'NVIDIA App'; Page = 'https://www.nvidia.com/en-us/software/nvidia-app/';
+                    Pattern = 'https://[^"''\s<>]*NVIDIA_app_v[0-9.]+_x64\.exe'; Publisher = 'NVIDIA';
+                    Referer = ''; Open = 'https://www.nvidia.com/pt-br/software/nvidia-app/' }
+        amd    = @{ Name = 'AMD Software: Adrenalin Edition'; Page = 'https://www.amd.com/en/support/download/drivers.html';
+                    Pattern = 'https://drivers\.amd\.com/[^"''\s<>]*minimalsetup[^"''\s<>]*\.exe'; Publisher = 'Advanced Micro Devices';
+                    Referer = 'https://www.amd.com/'; Open = 'https://www.amd.com/pt/support/download/drivers.html' }
+        intel  = @{ Name = 'Intel Driver & Support Assistant'; Url = 'https://dsadata.intel.com/installer'; Publisher = 'Intel';
+                    Referer = ''; Open = 'https://www.intel.com.br/content/www/br/pt/support/detect.html' }
+    }
+    $info = $all[$Vendor]
+    try {
+        $url = $info.Url
+        if (-not $url) {
+            $m = [regex]::Match((Get-Page $info.Page), $info.Pattern)
+            if (-not $m.Success) { throw 'link do instalador não encontrado no site' }
+            $url = $m.Value
+        }
+        $file = Join-Path (Join-Path $env:TEMP 'prisma-dl') ($Vendor + '-driver-setup.exe')
+        Say ("Baixando {0}..." -f $info.Name)
+        Download-File $url $file $info.Referer
+        if (-not (Test-Signed $file $info.Publisher)) { throw 'assinatura digital não confere' }
+        Start-Process -FilePath $file
+        Ok ("Instalador do {0} aberto na tela: siga os passos para instalar o driver mais novo." -f $info.Name)
+    } catch {
+        Warn ("Não deu para baixar o {0} automaticamente ({1}). Abri a página oficial." -f $info.Name, $_.Exception.Message)
+        Open-Url $info.Open
+    }
+}
+
+$gpus = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -like 'PCI\*' })
+if ($gpus.Count -eq 0) { Warn 'Nenhuma placa de vídeo encontrada'; return }
+$done = @{}
+foreach ($g in $gpus) {
+    $vendor = switch -Regex ($g.PNPDeviceID) { 'VEN_10DE' { 'nvidia' } 'VEN_1002' { 'amd' } 'VEN_8086' { 'intel' } default { '' } }
+    Say ("Placa de vídeo: {0} (driver atual {1})" -f $g.Name, $g.DriverVersion)
+    if (-not $vendor) { Say 'Fabricante não reconhecido: use o driver do Windows Update.'; continue }
+    if ($done.ContainsKey($vendor)) { continue }
+    $done[$vendor] = $true
+    Install-GpuTool $vendor
+}
 """,
 )
 

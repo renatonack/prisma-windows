@@ -14,14 +14,15 @@ from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QGr
 from . import APP_NAME, APP_VERSION, sysinfo
 from .glass import (AA, Backdrop, Chip, Fonts, GlassButton, GlassPanel, GlyphLabel, Icon, IconButton, K,
                     LiquidLens, PrismLogo, ProgressLine, Toggle, W, _Hover, font, make_app_icon, paint_glass)
+from .hardware import HardwareScanner
 from .runner import Runner, log_dir, plan_run
-from .tasks import (PAGE_DEBLOAT, PAGE_INSTALAR, PAGE_OTIMIZACAO, PAGE_REMOVER, TASKS, Task, tasks_for_page,
-                    video_tasks)
+from .tasks import (PAGE_DEBLOAT, PAGE_DRIVERS, PAGE_INSTALAR, PAGE_OTIMIZACAO, PAGE_REMOVER, TASKS, Task,
+                    tasks_for_page, video_tasks)
 
 VIDEO_URL = "https://youtu.be/BQjZOr1Nye4"
 VIDEO_TITLE = "Windows 11 lento? Como fazer DEBLOAT"
-PAGE_NAMES = ["Início", "Debloat", "Otimização", "Remover apps", "Instalar apps"]
-PAGE_KEYS = [None, PAGE_DEBLOAT, PAGE_OTIMIZACAO, PAGE_REMOVER, PAGE_INSTALAR]
+PAGE_NAMES = ["Início", "Debloat", "Otimização", "Drivers", "Remover apps", "Instalar apps"]
+PAGE_KEYS = [None, PAGE_DEBLOAT, PAGE_OTIMIZACAO, PAGE_DRIVERS, PAGE_REMOVER, PAGE_INSTALAR]
 MEDIUM = QFont.Weight.Medium
 SEMI = QFont.Weight.DemiBold
 
@@ -203,7 +204,8 @@ class TaskPage(QWidget):
     apply_requested = Signal(str)
 
     def __init__(self, page: str, title: str, subtitle: str, sel: Selection, verb: str, noun: str,
-                 section_order: list[str] | None = None, pinned: tuple[str, ...] = (), quick_video: bool = False):
+                 section_order: list[str] | None = None, pinned: tuple[str, ...] = (), quick_video: bool = False,
+                 top: QWidget | None = None):
         super().__init__()
         self.page, self.sel, self.verb, self.noun = page, sel, verb, noun
         self.rows: dict[str, TaskRow] = {}
@@ -217,6 +219,8 @@ class TaskPage(QWidget):
         iv = QVBoxLayout(inner)
         iv.setContentsMargins(0, 0, 12, 10)
         iv.setSpacing(10)
+        if top is not None:
+            iv.addWidget(top)
         tasks = tasks_for_page(page)
         sections: list[str] = []
         for t in tasks:
@@ -283,6 +287,73 @@ class TaskPage(QWidget):
         for b in self.quick:
             b.setEnabled(not busy)
         self.refresh()
+
+
+class HardwareCard(GlassPanel):
+    """Mostra a placa de vídeo detectada e os dispositivos com problema."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent, radius=20, tint=10)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(12)
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        head.addWidget(GlyphLabel(Icon.DEVICES, 17, 225))
+        head.addWidget(label("Seu hardware", 14, SEMI, 242), 1)
+        self.chip = Chip("detectando...")
+        head.addWidget(self.chip)
+        v.addLayout(head)
+        self.body = label("Procurando a placa de vídeo e dispositivos sem driver...", 12.5, alpha=140)
+        v.addWidget(self.body)
+        self._v = v
+        self.scanner = HardwareScanner(self)
+        self.scanner.done.connect(self.show_result)
+        self.scanner.start()
+
+    def show_result(self, data: dict) -> None:
+        new = QWidget()
+        bl = QVBoxLayout(new)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(10)
+        if data.get("error"):
+            bl.addWidget(label("Não consegui ler o hardware agora. As tarefas abaixo funcionam mesmo assim.",
+                               12.5, alpha=150, wrap=True))
+        for g in data.get("gpus", []):
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            col.addWidget(label(g["name"], 13.5, MEDIUM, 240))
+            sub = f"Driver {g['version']}" + (f" · {g['date']}" if g["date"] else "")
+            if g["tool"]:
+                sub += f"   →   app oficial: {g['tool']}"
+            col.addWidget(label(sub, 12, alpha=140, wrap=True))
+            row.addLayout(col, 1)
+            if g["vendor"]:
+                row.addWidget(Chip(g["vendor"]), 0, Qt.AlignmentFlag.AlignVCenter)
+            bl.addLayout(row)
+        problems = data.get("problems", [])
+        if problems:
+            names = ", ".join(p["name"] for p in problems[:3]) + ("..." if len(problems) > 3 else "")
+            no_driver = sum(1 for p in problems if p["code"] == 28)
+            text = f"{len(problems)} dispositivo{'s' if len(problems) > 1 else ''} com problema: {names}."
+            if no_driver:
+                text += f" {no_driver} sem driver — a primeira tarefa abaixo resolve."
+            glyph = Icon.WARN
+        else:
+            text, glyph = "Todos os dispositivos estão com driver.", Icon.CHECK
+        line = QHBoxLayout()
+        line.setSpacing(8)
+        line.addWidget(GlyphLabel(glyph, 13, 210), 0, Qt.AlignmentFlag.AlignTop)
+        line.addWidget(label(text, 12.5, alpha=175, wrap=True), 1)
+        bl.addLayout(line)
+        self._v.replaceWidget(self.body, new)
+        self.body.deleteLater()
+        self.body = new
+        self.chip.set_text(f"{len(problems)} alerta{'s' if len(problems) != 1 else ''}" if problems else "tudo certo")
+        self.chip.solid = not problems
+        self.chip.update()
 
 
 class Monogram(QWidget):
@@ -482,7 +553,8 @@ class HomePage(QWidget):
         left.addWidget(label("Windows leve,\nem um clique.", 44, SEMI, 252, family=Fonts.display))
         body = label("Aplica exatamente o que o Canaltech recomendou no vídeo — WinUtil + O&O ShutUp10 — "
                      "já adaptado para Brave, Steam, Discord, WhatsApp e Claude. Remove o Edge e o que a "
-                     "Microsoft instala para encher o saco.", 14, alpha=172, wrap=True)
+                     "Microsoft instala para encher o saco, e instala os drivers que faltam.", 14, alpha=172,
+                     wrap=True)
         body.setMaximumWidth(560)
         left.addWidget(body)
         left.addSpacing(6)
@@ -625,8 +697,8 @@ class Sidebar(GlassPanel):
         v.addWidget(brand)
         v.addSpacing(22)
         self.items: list[NavButton] = []
-        for i, (name, glyph) in enumerate(zip(PAGE_NAMES, (Icon.HOME, Icon.SHIELD, Icon.BOLT, Icon.DELETE,
-                                                          Icon.DOWNLOAD))):
+        for i, (name, glyph) in enumerate(zip(PAGE_NAMES, (Icon.HOME, Icon.SHIELD, Icon.BOLT, Icon.DEVICES,
+                                                          Icon.DELETE, Icon.DOWNLOAD))):
             b = NavButton(name, glyph)
             b.clicked.connect(lambda i=i: self.page_selected.emit(i))
             v.addWidget(b)
@@ -979,6 +1051,12 @@ class MainWindow(QWidget):
             "Limpeza (feita no vídeo) e ajustes extras de desempenho para jogos.",
             self.sel, "Aplicar", "ajustes", section_order=["Limpeza", "Desempenho", "Navegador", "Extras"],
             quick_video=True)
+        self.p_drivers = TaskPage(
+            PAGE_DRIVERS, "Drivers",
+            "Instala o que falta pelo Windows Update (fonte oficial da Microsoft) e o app da fabricante da sua "
+            "placa de vídeo, que traz o driver mais novo para jogos.",
+            self.sel, "Instalar", "itens", section_order=["Windows Update", "Placa de vídeo"],
+            top=HardwareCard())
         self.p_remove = TaskPage(
             PAGE_REMOVER, "Remover apps inúteis",
             "Tira o Edge e o que a Microsoft instala para encher o saco. Os pacotes também saem para novos "
@@ -986,9 +1064,9 @@ class MainWindow(QWidget):
             self.sel, "Remover", "itens", section_order=["Navegador", "Microsoft", "Pré-instalados"],
             pinned=("remove_onedrive",))
         self.p_install = AppsPage(self.sel, self.installed)
-        for pg in (self.p_debloat, self.p_otim, self.p_remove, self.p_install):
+        for pg in (self.p_debloat, self.p_otim, self.p_drivers, self.p_remove, self.p_install):
             pg.apply_requested.connect(self.run_page)
-        for w in (self.home, self.p_debloat, self.p_otim, self.p_remove, self.p_install):
+        for w in self._pages():
             self.stack.addWidget(w)
         right.addWidget(self.stack, 1)
         self.activity = ActivityPanel()
@@ -1130,13 +1208,13 @@ class MainWindow(QWidget):
     def run_everything(self) -> None:
         self.request_run(self.sel.selected(), "Fazer tudo",
                          "Vai aplicar tudo o que está marcado em todas as páginas: debloat, otimização, "
-                         "instalação e remoção de apps.")
+                         "drivers, instalação e remoção de apps.")
 
     def run_page(self, page: str) -> None:
         ids = self.sel.selected(page)
-        if page in (PAGE_OTIMIZACAO, PAGE_REMOVER) and self.sel.state.get("restore_point"):
+        if page in (PAGE_OTIMIZACAO, PAGE_DRIVERS, PAGE_REMOVER) and self.sel.state.get("restore_point"):
             ids.append("restore_point")
-        names = {PAGE_DEBLOAT: "Debloat e privacidade", PAGE_OTIMIZACAO: "Otimização",
+        names = {PAGE_DEBLOAT: "Debloat e privacidade", PAGE_OTIMIZACAO: "Otimização", PAGE_DRIVERS: "Drivers",
                  PAGE_REMOVER: "Remover apps", PAGE_INSTALAR: "Instalar apps"}
         self.request_run(ids, names[page], "Vai aplicar os itens marcados nesta página.")
 
@@ -1154,6 +1232,7 @@ class MainWindow(QWidget):
         parts = []
         for key, one, many in ((PAGE_DEBLOAT, "ajuste de debloat", "ajustes de debloat"),
                                (PAGE_OTIMIZACAO, "de otimização", "de otimização"),
+                               (PAGE_DRIVERS, "tarefa de drivers", "tarefas de drivers"),
                                (PAGE_INSTALAR, "app para instalar", "apps para instalar"),
                                (PAGE_REMOVER, "item para remover", "itens para remover")):
             n = counts.get(key, 0)
@@ -1173,10 +1252,10 @@ class MainWindow(QWidget):
                 [("Cancelar", "ghost", None), ("Começar", "primary", lambda: self.start_run(tasks, title))])
 
     def _pages(self):
-        return (self.home, self.p_debloat, self.p_otim, self.p_remove, self.p_install)
+        return (self.home, self.p_debloat, self.p_otim, self.p_drivers, self.p_remove, self.p_install)
 
     def _row_widgets(self, tid: str):
-        for pg in (self.p_debloat, self.p_otim, self.p_remove):
+        for pg in (self.p_debloat, self.p_otim, self.p_drivers, self.p_remove):
             if tid in pg.rows:
                 yield pg.rows[tid]
         if tid in self.p_install.cards:
@@ -1186,6 +1265,7 @@ class MainWindow(QWidget):
         if self.busy:
             return
         self.busy = True
+        self._running_ids = {t.id for t in tasks}
         for pg in self._pages():
             pg.set_busy(True)
         for t in tasks:
@@ -1261,7 +1341,11 @@ class MainWindow(QWidget):
         if warn or err:
             body += "Avisos e erros estão no registro (painel de baixo). Itens com aviso normalmente foram aplicados " \
                     "em parte — por exemplo, um app que já não existia.<br><br>"
-        body += "<b>Reinicie o PC</b> para que todas as mudanças tenham efeito."
+        if "drivers_gpu" in getattr(self, "_running_ids", set()):
+            body += "Se o instalador da placa de vídeo abriu, <b>termine ele primeiro</b>. Depois, "
+            body += "<b>reinicie o PC</b> para que todas as mudanças tenham efeito."
+        else:
+            body += "<b>Reinicie o PC</b> para que todas as mudanças tenham efeito."
         Overlay(self, Icon.CHECK if not err else Icon.WARN, "Pronto!", body,
                 [("Ver arquivo de registro", "ghost", self.open_log), ("Depois", "glass", None),
                  ("Reiniciar agora", "primary", self.restart)])
